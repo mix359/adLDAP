@@ -117,7 +117,7 @@ class adLDAP {
      * @var string
      * @var string
      */
-    protected $adminUsernameUsername = NULL;
+    protected $adminUsername = NULL;
     protected $adminPassword = NULL;
 
     /**
