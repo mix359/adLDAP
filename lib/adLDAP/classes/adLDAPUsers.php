@@ -3,6 +3,7 @@
 namespace adLDAP\classes;
 
 use adLDAP\adLDAP;
+use adLDAP\adLDAPException;
 
 /**
  * PHP LDAP CLASS FOR MANIPULATING ACTIVE DIRECTORY 
@@ -62,7 +63,7 @@ class adLDAPUsers {
      * 
      * @param string $username A user's AD username
      * @param string $password A user's AD password
-     * @param bool optional $prevent_rebind
+     * @param bool $preventRebind
      * @return bool
      */
     public function authenticate($username, $password, $preventRebind = false) {
@@ -75,27 +76,27 @@ class adLDAPUsers {
      * If you specify a password here, this can only be performed over SSL
      * 
      * @param array $attributes The attributes to set to the user account
-     * @return bool
+     * @throws adLDAPException
      */
     public function create($attributes) {
         // Check for compulsory fields
         if (!array_key_exists("username", $attributes)) {
-            return "Missing compulsory field [username]";
+            throw new adLDAPException("Missing compulsory field [username]");
         }
         if (!array_key_exists("firstname", $attributes)) {
-            return "Missing compulsory field [firstname]";
+            throw new adLDAPException("Missing compulsory field [firstname]");
         }
         if (!array_key_exists("surname", $attributes)) {
-            return "Missing compulsory field [surname]";
+            throw new adLDAPException("Missing compulsory field [surname]");
         }
         if (!array_key_exists("email", $attributes)) {
-            return "Missing compulsory field [email]";
+            throw new adLDAPException("Missing compulsory field [email]");
         }
         if (!array_key_exists("container", $attributes)) {
-            return "Missing compulsory field [container]";
+            throw new adLDAPException("Missing compulsory field [container]");
         }
         if (!is_array($attributes["container"])) {
-            return "Container attribute must be an array.";
+            throw new adLDAPException("Container attribute must be an array.");
         }
 
         if (array_key_exists("password", $attributes) && (!$this->adldap->getUseSSL() && !$this->adldap->getUseTLS())) {
@@ -130,12 +131,16 @@ class adLDAPUsers {
        
        // $container = "OU=" . implode(", OU=", $attributes["container"]);
 
+        foreach ($add as $k => $v) {
+            if(empty($v))
+                unset($add[$k]);
+        }
+
         // Add the entry
         $result = @ldap_add($this->adldap->getLdapConnection(), "CN=" . $add["cn"][0] . $container . "," . $this->adldap->getBaseDn(), $add);
         if ($result != true) {
-            return false;
+            throw new adLDAPException("Error during add user: '".ldap_error($this->adldap->getLdapConnection())."'");
         }
-        return true;
     }
 
     /**
@@ -216,42 +221,52 @@ class adLDAPUsers {
 
     /**
      * Delete a user account
-     * 
+     *
      * @param string $username The username to delete (please be careful here!)
      * @param bool $isGUID Is the username a GUID or a samAccountName
-     * @return array
+     * @throws adLDAPException
      */
     public function delete($username, $isGUID = false) {
         $userinfo = $this->info($username, array("*"), $isGUID);
-        $dn = $userinfo[0]['distinguishedname'][0];
-        $result = $this->adldap->folder()->delete($dn);
-        if ($result != true) {
-            return false;
+        if(!isset($userinfo[0])) {
+            return;
         }
-        return true;
+
+        $dn = $userinfo[0]['distinguishedname'][0];
+
+        try {
+            $this->adldap->folder()->delete($dn);
+        } catch (adLDAPException $e) {
+            throw new adLDAPException("Error during delete user: '".ldap_error($this->adldap->getLdapConnection())."'");
+        }
     }
 
     /**
      * Groups the user is a member of
-     * 
+     *
      * @param string $username The username to query
      * @param bool $recursive Recursive list of groups
      * @param bool $isGUID Is the username passed a GUID or a samAccountName
      * @return array
+     * @throws adLDAPException
      */
     public function groups($username, $recursive = NULL, $isGUID = false) {
         if ($username === NULL) {
-            return false;
+            throw new adLDAPException("Username empty");
         }
         if ($recursive === NULL) {
             $recursive = $this->adldap->getRecursiveGroups();
         } // Use the default option if they haven't set it
         if (!$this->adldap->getLdapBind()) {
-            return false;
+            throw new adLDAPException("Ldap not binded");
         }
 
         // Search the directory for their information
         $info = @$this->info($username, array("memberof", "primarygroupid"), $isGUID);
+        if(!isset($info[0])) {
+            return [];
+        }
+
         $groups = $this->adldap->utilities()->niceNames($info[0]["memberof"]); // Presuming the entry returned is our guy (unique usernames)
 
         if ($recursive === true) {
@@ -270,18 +285,19 @@ class adLDAPUsers {
      * @param array $fields Array of parameters to query
      * @param bool $isGUID Is the username passed a GUID or a samAccountName
      * @return array
+     * @throws adLDAPException
      */
     public function info($username, $fields = NULL, $isGUID = false) {
         if ($username === NULL) {
-            return false;
+            throw new adLDAPException("Username empty");
         }
         if (!$this->adldap->getLdapBind()) {
-            return false;
+            throw new adLDAPException("Ldap not binded");
         }
 
         if ($isGUID === true) {
             $username = $this->adldap->utilities()->strGuidToHex($username);
-            $filter = "objectguid=" . $username;
+            $filter = "objectGUID=" . $username;
         } else if (strpos($username, "@")) {
             $filter = "userPrincipalName=" . $username;
         } else {
@@ -297,50 +313,47 @@ class adLDAPUsers {
         $sr = ldap_search($this->adldap->getLdapConnection(), $this->adldap->getBaseDn(), $filter, $fields);
         $entries = ldap_get_entries($this->adldap->getLdapConnection(), $sr);
 
-        if (isset($entries[0])) {
-            if ($entries[0]['count'] >= 1) {
-                if (in_array("memberof", $fields)) {
-                    // AD does not return the primary group in the ldap query, we may need to fudge it
-                    if ($this->adldap->getRealPrimaryGroup() && isset($entries[0]["primarygroupid"][0]) && isset($entries[0]["objectsid"][0])) {
-                        //$entries[0]["memberof"][]=$this->group_cn($entries[0]["primarygroupid"][0]);
-                        $entries[0]["memberof"][] = $this->adldap->group()->getPrimaryGroup($entries[0]["primarygroupid"][0], $entries[0]["objectsid"][0]);
-                    } else {
-                        $entries[0]["memberof"][] = "CN=Domain Users,CN=Users," . $this->adldap->getBaseDn();
-                    }
-                    if (!isset($entries[0]["memberof"]["count"])) {
-                        $entries[0]["memberof"]["count"] = 0;
-                    }
-                    $entries[0]["memberof"]["count"] ++;
-                }
-            }
-            return $entries;
+        if (!isset($entries[0])) {
+            return [];
         }
-        return false;
+
+        if ($entries[0]['count'] >= 1) {
+            if (in_array("memberof", $fields)) {
+                // AD does not return the primary group in the ldap query, we may need to fudge it
+                if ($this->adldap->getRealPrimaryGroup() && isset($entries[0]["primarygroupid"][0]) && isset($entries[0]["objectsid"][0])) {
+                    //$entries[0]["memberof"][]=$this->group_cn($entries[0]["primarygroupid"][0]);
+                    $entries[0]["memberof"][] = $this->adldap->group()->getPrimaryGroup($entries[0]["primarygroupid"][0], $entries[0]["objectsid"][0]);
+                } else {
+                    $entries[0]["memberof"][] = "CN=Domain Users,CN=Users," . $this->adldap->getBaseDn();
+                }
+                if (!isset($entries[0]["memberof"]["count"])) {
+                    $entries[0]["memberof"]["count"] = 0;
+                }
+                $entries[0]["memberof"]["count"] ++;
+            }
+        }
+        return $entries;
     }
 
     /**
      * Find information about the users. Returned in a raw array format from AD
-     * 
+     *
      * @param string $username The username to query
      * @param array $fields Array of parameters to query
      * @param bool $isGUID Is the username passed a GUID or a samAccountName
-     * @return mixed
+     * @return \adLDAP\collections\adLDAPUserCollection
+     * @throws adLDAPException
      */
     public function infoCollection($username, $fields = NULL, $isGUID = false) {
         if ($username === NULL) {
-            return false;
+            throw new adLDAPException("Username empty");
         }
         if (!$this->adldap->getLdapBind()) {
-            return false;
+            throw new adLDAPException("Ldap not binded");
         }
 
         $info = $this->info($username, $fields, $isGUID);
-
-        if ($info !== false) {
-            $collection = new \adLDAP\collections\adLDAPUserCollection($info, $this->adldap);
-            return $collection;
-        }
-        return false;
+        return new \adLDAP\collections\adLDAPUserCollection($info, $this->adldap);
     }
 
     /**
@@ -351,16 +364,17 @@ class adLDAPUsers {
      * @param bool $recursive Check groups recursively
      * @param bool $isGUID Is the username passed a GUID or a samAccountName
      * @return bool
+     * @throws adLDAPException
      */
     public function inGroup($username, $group, $recursive = NULL, $isGUID = false) {
         if ($username === NULL) {
-            return false;
+            throw new adLDAPException("Username empty");
         }
         if ($group === NULL) {
-            return false;
+            throw new adLDAPException("Group empty");
         }
         if (!$this->adldap->getLdapBind()) {
-            return false;
+            throw new adLDAPException("Ldap not binded");
         }
         if ($recursive === NULL) {
             $recursive = $this->adldap->getRecursiveGroups();
@@ -379,19 +393,20 @@ class adLDAPUsers {
      * Determine a user's password expiry date
      * 
      * @param string $username The username to query
-     * @param book $isGUID Is the username passed a GUID or a samAccountName
+     * @param bool $isGUID Is the username passed a GUID or a samAccountName
      * @requires bcmath http://www.php.net/manual/en/book.bc.php
-     * @return array
+     * @return array|bool false if not expire
+     * @throws adLDAPException
      */
     public function passwordExpiry($username, $isGUID = false) {
         if ($username === NULL) {
-            return "Missing compulsory field [username]";
+            throw new adLDAPException("Username empty");
         }
         if (!$this->adldap->getLdapBind()) {
-            return false;
+            throw new adLDAPException("Ldap not binded");
         }
         if (!function_exists('bcmod')) {
-            throw new \adLDAP\adLDAPException("Missing function support [bcmod] http://www.php.net/manual/en/book.bc.php");
+            throw new adLDAPException("Missing function support [bcmod] http://www.php.net/manual/en/book.bc.php");
         };
 
         $userInfo = $this->info($username, array("pwdlastset", "useraccountcontrol"), $isGUID);
@@ -400,11 +415,13 @@ class adLDAPUsers {
 
         if ($userInfo[0]['useraccountcontrol'][0] == '66048') {
             // Password does not expire
-            return "Does not expire";
+            return false;
         }
         if ($pwdLastSet === '0') {
+            $status['expiryts'] = time();
+            $status['expiryformat'] = date('Y-m-d H:i:s');
             // Password has already expired
-            return "Password has expired";
+            return $status;
         }
 
         // Password expiry in AD can be calculated from TWO values:
@@ -415,15 +432,15 @@ class adLDAPUsers {
         // This function will convert them to Unix timestamps
         $sr = ldap_read($this->adldap->getLdapConnection(), $this->adldap->getBaseDn(), 'objectclass=*', array('maxPwdAge'));
         if (!$sr) {
-            return false;
+            throw new adLDAPException("Error reading user data '".ldap_error($this->adldap->getLdapConnection())."'");
         }
         $info = ldap_get_entries($this->adldap->getLdapConnection(), $sr);
         $maxPwdAge = $info[0]['maxpwdage'][0];
 
         // See MSDN: http://msdn.microsoft.com/en-us/library/ms974598.aspx
         //
-         // pwdLastSet contains the number of 100 nanosecond intervals since January 1, 1601 (UTC), 
-        // stored in a 64 bit integer. 
+         // pwdLastSet contains the number of 100 nanosecond intervals since January 1, 1601 (UTC),
+        // stored in a 64 bit integer.
         //
          // The number of seconds between this date and Unix epoch is 11644473600.
         //
@@ -437,7 +454,7 @@ class adLDAPUsers {
          // Unfortunately the maths involved are too big for PHP integers, so I've had to require
         // BCMath functions to work with arbitrary precision numbers.
         if (bcmod($maxPwdAge, 4294967296) === '0') {
-            return "Domain does not expire passwords";
+            return false;
         }
 
         // Add maxpwdage and pwdlastset and we get password expiration time in Microsoft's
@@ -457,11 +474,11 @@ class adLDAPUsers {
      * @param string $username The username to query
      * @param array $attributes The attributes to modify.  Note if you set the enabled attribute you must not specify any other attributes
      * @param bool $isGUID Is the username passed a GUID or a samAccountName
-     * @return bool
+     * @throws adLDAPException
      */
     public function modify($username, $attributes, $isGUID = false) {
         if ($username === NULL) {
-            return "Missing compulsory field [username]";
+            throw new adLDAPException("Missing compulsory field [username]");
         }
         if (array_key_exists("password", $attributes) && !$this->adldap->getUseSSL() && !$this->adldap->getUseTLS()) {
             throw new \adLDAP\adLDAPException('SSL/TLS must be configured on your webserver and enabled in the class to set passwords.');
@@ -470,7 +487,7 @@ class adLDAPUsers {
         // Find the dn of the user
         $userDn = $this->dn($username, $isGUID);
         if ($userDn === false) {
-            return false;
+            throw new adLDAPException("dn of the user empty");
         }
 
         // Translate the update to the LDAP schema                
@@ -478,7 +495,7 @@ class adLDAPUsers {
 
         // Check to see if this is an enabled status update
         if (!$mod && !array_key_exists("enabled", $attributes)) {
-            return false;
+            throw new adLDAPException("status update not enabled");
         }
 
         // Set the account control attribute (only if specified)
@@ -494,9 +511,8 @@ class adLDAPUsers {
         // Do the update
         $result = @ldap_modify($this->adldap->getLdapConnection(), $userDn, $mod);
         if ($result == false) {
-            return false;
+            throw new adLDAPException("Error during user modify '".ldap_error($this->adldap->getLdapConnection())."'");
         }
-        return true;
     }
 
     /**
@@ -504,19 +520,15 @@ class adLDAPUsers {
      * 
      * @param string $username The username to disable
      * @param bool $isGUID Is the username passed a GUID or a samAccountName
-     * @return bool
+     * @throws adLDAPException
      */
     public function disable($username, $isGUID = false) {
         if ($username === NULL) {
-            return "Missing compulsory field [username]";
-        }
-        $attributes = array("enabled" => 0);
-        $result = $this->modify($username, $attributes, $isGUID);
-        if ($result == false) {
-            return false;
+            throw new adLDAPException("Missing compulsory field [username]");
         }
 
-        return true;
+        $attributes = array("enabled" => 0);
+        $this->modify($username, $attributes, $isGUID);
     }
 
     /**
@@ -524,19 +536,14 @@ class adLDAPUsers {
      * 
      * @param string $username The username to enable
      * @param bool $isGUID Is the username passed a GUID or a samAccountName
-     * @return bool
+     * @throws adLDAPException
      */
     public function enable($username, $isGUID = false) {
         if ($username === NULL) {
-            return "Missing compulsory field [username]";
+            throw new adLDAPException("Missing compulsory field [username]");
         }
         $attributes = array("enabled" => 1);
-        $result = $this->modify($username, $attributes, $isGUID);
-        if ($result == false) {
-            return false;
-        }
-
-        return true;
+        $this->modify($username, $attributes, $isGUID);
     }
 
     /**
@@ -545,26 +552,23 @@ class adLDAPUsers {
      * @param string $username The username to modify
      * @param string $password The new password
      * @param bool $isGUID Is the username passed a GUID or a samAccountName
-     * @return bool
+     * @throws adLDAPException
      */
     public function password($username, $password, $isGUID = false) {
         if ($username === NULL) {
-            return false;
+            throw new adLDAPException("Missing username");
         }
         if ($password === NULL) {
-            return false;
+            throw new adLDAPException("Missing password");
         }
         if (!$this->adldap->getLdapBind()) {
-            return false;
+            throw new adLDAPException("Ldap not binded");
         }
         if (!$this->adldap->getUseSSL() && !$this->adldap->getUseTLS()) {
-            throw new \adLDAP\adLDAPException('SSL must be configured on your webserver and enabled in the class to set passwords.');
+            throw new adLDAPException('SSL must be configured on your webserver and enabled in the class to set passwords.');
         }
 
         $userDn = $this->dn($username, $isGUID);
-        if ($userDn === false) {
-            return false;
-        }
 
         $add = array();
         $add["unicodePwd"][0] = $this->encodePassword($password);
@@ -577,12 +581,11 @@ class adLDAPUsers {
                 if ($err == 53) {
                     $msg .= ' Your password might not match the password policy.';
                 }
-                throw new \adLDAP\adLDAPException($msg);
             } else {
-                return false;
+                $msg = "Error setting the user password";
             }
+            throw new adLDAPException($msg);
         }
-        return true;
     }
 
     /**
@@ -601,17 +604,18 @@ class adLDAPUsers {
     }
 
     /**
-     * Obtain the user's distinguished name based on their userid 
-     * 
-     * 
+     * Obtain the user's distinguished name based on their userid
+     *
+     *
      * @param string $username The username
      * @param bool $isGUID Is the username passed a GUID or a samAccountName
      * @return string
+     * @throws adLDAPException
      */
     public function dn($username, $isGUID = false) {
         $user = $this->info($username, array("cn"), $isGUID);
-        if ($user[0]["dn"] === NULL) {
-            return false;
+        if (!isset($user[0]) || $user[0]["dn"] === NULL) {
+            throw new adLDAPException("Invalid user dn");
         }
         $userDn = $user[0]["dn"];
         return $userDn;
@@ -624,10 +628,11 @@ class adLDAPUsers {
      * @param string $search Search parameter
      * @param bool $sorted Sort the user accounts
      * @return array
+     * @throws adLDAPException
      */
     public function all($includeDescription = false, $search = "*", $sorted = true) {
         if (!$this->adldap->getLdapBind()) {
-            return false;
+            throw new adLDAPException("Ldap not binded");
         }
 
         // Perform the search and grab all their details
@@ -647,7 +652,7 @@ class adLDAPUsers {
                 $id = $entries[$i]["samaccountname"][0];
                 $usersArray[$id] = array();
                 foreach ($includeDescription as $detail) {
-                    $usersArray[$id][$detail] = @$entries[$i][$detail][0];
+                    $usersArray[$id][$detail] = isset($entries[$i][$detail][0]) ? $entries[$i][$detail][0] : '';
                 }
             } else {
                 array_push($usersArray, $entries[$i]["samaccountname"][0]);
@@ -664,25 +669,27 @@ class adLDAPUsers {
      * 
      * @param string $username The username to query
      * @return string
+     * @throws adLDAPException
      */
     public function usernameToGuid($username) {
         if (!$this->adldap->getLdapBind()) {
-            return false;
+            throw new adLDAPException("Ldap not binded");
         }
         if ($username === null) {
-            return "Missing compulsory field [username]";
+            throw new adLDAPException("Missing username");
         }
 
         $filter = "samaccountname=" . $username;
         $fields = array("objectGUID");
         $sr = @ldap_search($this->adldap->getLdapConnection(), $this->adldap->getBaseDn(), $filter, $fields);
-        if (ldap_count_entries($this->adldap->getLdapConnection(), $sr) > 0) {
-            $entry = @ldap_first_entry($this->adldap->getLdapConnection(), $sr);
-            $guid = @ldap_get_values_len($this->adldap->getLdapConnection(), $entry, 'objectGUID');
-            $strGUID = $this->adldap->utilities()->binaryToText($guid[0]);
-            return $strGUID;
+        if (ldap_count_entries($this->adldap->getLdapConnection(), $sr) < 1) {
+            throw new adLDAPException("Missing guid for username");
         }
-        return false;
+
+        $entry = @ldap_first_entry($this->adldap->getLdapConnection(), $sr);
+        $guid = @ldap_get_values_len($this->adldap->getLdapConnection(), $entry, 'objectGUID');
+        $strGUID = $this->adldap->utilities()->binaryToText($guid[0]);
+        return $strGUID;
     }
 
     /**
@@ -693,10 +700,11 @@ class adLDAPUsers {
      * @param string $searchFilter Value to search for in the specified field
      * @param bool $sorted Sort the user accounts
      * @return array
+     * @throws adLDAPException
      */
     public function find($includeDescription = false, $searchField = false, $searchFilter = false, $sorted = true) {
         if (!$this->adldap->getLdapBind()) {
-            return false;
+            throw new adLDAPException("Ldap not binded");
         }
 
         // Perform the search and grab all their details
@@ -722,7 +730,7 @@ class adLDAPUsers {
         if ($sorted) {
             asort($usersArray);
         }
-        return ($usersArray);
+        return $usersArray;
     }
 
     /**
@@ -731,23 +739,27 @@ class adLDAPUsers {
      * @param string $username The username to move (please be careful here!)
      * @param array $container The container or containers to move the user to (please be careful here!).
      * accepts containers in 1. parent 2. child order
-     * @return array
+     * @throws adLDAPException
      */
     public function move($username, $container) {
         if (!$this->adldap->getLdapBind()) {
-            return false;
+            throw new adLDAPException("Ldap not binded");
         }
         if ($username === null) {
-            return "Missing compulsory field [username]";
+            throw new adLDAPException("Missing compulsory field [username]");
         }
         if ($container === null) {
-            return "Missing compulsory field [container]";
+            throw new adLDAPException("Missing compulsory field [container]");
         }
         if (!is_array($container)) {
-            return "Container must be an array";
+            throw new adLDAPException("Container must be an array");
         }
 
         $userInfo = $this->info($username, array("*"));
+        if(!isset($userInfo[0]) || !isset($userInfo[0]['distinguishedname']) || !isset($userInfo[0]['distinguishedname'][0])) {
+            throw new adLDAPException("Invalid or not existent user");
+        }
+
         $dn = $userInfo[0]['distinguishedname'][0];
         $newRDn = "cn=" . $username;
         $container = array_reverse($container);
@@ -755,51 +767,51 @@ class adLDAPUsers {
         $newBaseDn = strtolower($newContainer) . "," . $this->adldap->getBaseDn();
         $result = @ldap_rename($this->adldap->getLdapConnection(), $dn, $newRDn, $newBaseDn, true);
         if ($result !== true) {
-            return false;
+            throw new adLDAPException("Error during user move '".ldap_error($this->adldap->getLdapConnection())."'");
         }
-        return true;
     }
 
     /**
      * Get the last logon time of any user as a Unix timestamp
      * 
      * @param string $username
-     * @return long $unixTimestamp
+     * @return int $unixTimestamp
+     * @throws adLDAPException
      */
     public function getLastLogon($username) {
         if (!$this->adldap->getLdapBind()) {
-            return false;
+            throw new adLDAPException("Ldap not binded");
         }
         if ($username === null) {
-            return "Missing compulsory field [username]";
+            throw new adLDAPException("Missing compulsory field [username]");
         }
         $userInfo = $this->info($username, array("lastLogonTimestamp"));
-        $lastLogon = adLDAPUtils::convertWindowsTimeToUnixTime($userInfo[0]['lastLogonTimestamp'][0]);
-        return $lastLogon;
+        return adLDAPUtils::convertWindowsTimeToUnixTime($userInfo[0]['lastLogonTimestamp'][0]);
     }
     
-private function paginated_search($filter, $fields, $pageSize = 500)
-{
-    $cookie = '';
-    $result = [];
-    $result['count'] = 0;
-    do {
+    private function paginated_search($filter, $fields, $pageSize = 500)
+    {
+        $cookie = '';
+        $result = [];
+        $result['count'] = 0;
+        do {
+            ldap_set_option($this->adldap->getLdapConnection(), LDAP_OPT_PROTOCOL_VERSION, 3);
+            ldap_control_paged_result($this->adldap->getLdapConnection(), $pageSize, true, $cookie);
 
-        ldap_set_option($this->adldap->getLdapConnection(), LDAP_OPT_PROTOCOL_VERSION, 3);
-        ldap_control_paged_result($this->adldap->getLdapConnection(), $pageSize, true, $cookie);
+            $sr = ldap_search($this->adldap->getLdapConnection(), $this->adldap->getBaseDn(), $filter, $fields);
+            $entries = ldap_get_entries($this->adldap->getLdapConnection(), $sr);
+            $entries['count'] += $result['count'];
 
-        $sr = ldap_search($this->adldap->getLdapConnection(), $this->adldap->getBaseDn(), $filter, $fields);
-        $entries = ldap_get_entries($this->adldap->getLdapConnection(), $sr);
-        $entries['count'] += $result['count'];
+            $result = array_merge($result, $entries);
 
-        $result = array_merge($result, $entries);
+            ldap_control_paged_result_response($this->adldap->getLdapConnection(), $sr, $cookie);
+            ldap_free_result($sr);
 
-        ldap_control_paged_result_response($this->adldap->getLdapConnection(), $sr, $cookie);
+        } while ($cookie !== null && $cookie != '');
 
-    } while ($cookie !== null && $cookie != '');
-ldap_control_paged_result($this->adldap->getLdapConnection(), 0);
-    return $result;
-}
+        ldap_control_paged_result($this->adldap->getLdapConnection(), 1000);
+        return $result;
+    }
     
 }
 
