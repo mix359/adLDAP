@@ -427,6 +427,10 @@ class adLDAPGroups {
                 }
                 continue;
             }
+
+            if (!isset($entries[0]['distinguishedname'][0])) {
+                continue;
+            }
             $groupArray[] = $entries[0]['distinguishedname'][0];
         }
 
